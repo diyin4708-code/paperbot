@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+*.log
+trader_state.json
+evolve_v25.json
+trader.lock
+.env
+.DS_Store
