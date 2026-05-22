@@ -1,67 +1,46 @@
 #!/usr/bin/env python3
 """
-🦅 PaperBot v27 — 6路信号 | 20x | 满仓单吊 | 趋势过滤
-标的: BTC/ETH/DOGE | 20x固定杠杆 | 动态仓位 | 时间止损
+🦅 币安期货测试网 v27.4 — 6路信号 | 20x | 主流+山寨 | 测试网API
+标的: BTC/ETH/DOGE + AVAX/LINK/APT/ARB/NEAR/SOL
 """
-import ccxt, time, sys, json, os, traceback
+import time, sys, json, os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
-
-# 🔬 量化模块
-sys.path.insert(0, str(Path(__file__).parent))
-from quant.hmm_regime import HMMRegime
-from quant.volatility import VolatilityModel
-from quant.var_manager import VaRManager
+from fengshui_engine import fengshui_bonus
 
 BOT_DIR = Path(__file__).parent
 LOG_DIR = BOT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 TZ = timezone(timedelta(hours=8))
-PROXY = "http://YOUR_HOST_IP:7897"
-STATE_FILE = BOT_DIR / "trader_state.json"
 EVOLVE_FILE = BOT_DIR / "evolve_v25.json"
 LOG_FILE = LOG_DIR / "trader_log.txt"
 MAX_LOG_LINES = 500  # 日志轮转上限
 
 # ─── 参数 ───
-START_BALANCE, LEVERAGE = 40.0, 20  # 固定20x，杠杆越大越亏
-
-def dynamic_leverage(sc):
-    return 20  # 固定20x
-
-# ─── 满仓单吊 (留5%缓冲) ───
-def dynamic_size_mult(sc):
-    """v27满仓: 95%可用余额做保证金"""
-    return 0.95
-SCAN_INTERVAL, COOLDOWN, TIMEOUT = 10, 30, 3600
-TP, SL = 2.0, 0.4  # 盈亏比5:1，扣0.08%手续费后仍有净利
-
-# ─── 自适应止损：20x专版 ───
-def adaptive_sl(sc):
-    """20x下止损：sc≧75→宽, sc≧60→中, <60→紧"""
-    if sc >= 75: return (1.0, 2.50)   # 强信号给1%价格空间
-    elif sc >= 60: return (0.8, 1.50)
-    else: return (0.5, 1.00)
-TRAIL_ACTIVATE_USD = 1.00  # 覆盖手续费($0.27-0.35)后仍有安全垫
-TRAIL_TIERS = [(5.0, 1.50), (3.0, 0.80), (2.0, 0.50), (1.0, 0.30), (0.5, 0.20)]  # 每档留利润
-MAX_DAY_LOSS, MAX_DD = -0.10, 0.15
-MAX_LOSS_USD = 5.0    # 绝对亏损$5 立即永久熔断
-MAX_SINGLE_LOSS = 1.50  # 硬止损 > trail激活, 确保追迹先启动
-MAX_STUCK_MIN, STUCK_THRESHOLD = 60, -0.15
-TIME_STOP_MIN = 15  # 15分钟内不盈利就砍
-MAX_CONSEC_LOSSES = 2  # v26: 连续亏损阈值
-CONSEC_COOLDOWN = 1800  # v26: 连亏熔断冷却30分钟
-MIN_SCORE = 50  # 降低门槛，趋势过滤已兜底
-EVOLVE_VERSION = 27  # v27: 固定20x, 满仓单吊, 趋势过滤, 时间止损, 相关性过滤
+LEVERAGE = 20
+SCAN_INTERVAL, COOLDOWN, TIMEOUT = 20, 300, 3600  # v27.1: 15s减少API压力
+TP, SL = 4.0, 0.8  # 盈亏比5:1，扣0.08%手续费后仍有净利
+TRAIL_ACTIVATE_USD = 1.50  # 利润够大才激活
+TRAIL_TIERS = [(8.0, 3.00), (5.0, 2.00), (3.0, 1.50), (1.5, 0.80)]
+MAX_DAY_LOSS = -0.99  # 熔断已取消(雷先生要求)
+MAX_LOSS_USD = 99999   # 熔断已取消
+# 硬止损分币种: BTC 4%, ETH 5%, DOGE 6% (20x杠杆下=80%/100%/120%仓位)
+MAX_LOSS_MAP = {"BTC/USDT:USDT": 4.0, "ETH/USDT:USDT": 5.0, "DOGE/USDT:USDT": 6.0}
+MAX_STUCK_MIN, STUCK_THRESHOLD = 120, -0.40
+MAX_CONSEC_LOSSES = 3  # v27: 2→3(太紧致零开单), 配指数退避冷却
+CONSEC_COOLDOWN_BASE = 300   # 基础冷却300秒(5min)
+CONSEC_COOLDOWN_TIERS = [(2,300),(3,900),(4,2700),(5,7200)]  # (连亏数,冷却秒) 指数退避
+CONSEC_DECAY_SEC = 3600  # v27.1: 1h无交易自动清零连亏计数器
+MIN_SCORE = 45  # 降低门槛(原50/60)，自适应动态调节
+MIN_SCORE_BEAR = 48  # 熊市(周跌>5%)门槛提升，防逆势滥开多
+MIN_SCORE_BULL = 42  # 牛市(周涨>3%)门槛降低，顺势信号更宽松
+BALANCE_FAULT_THRESHOLD = 3  # 余额API连续失败N次才触发熔断
+EVOLVE_VERSION = 27  # v27→27: 余额API容错, 滑动窗口连亏冷却, 方向熔断, 自适应阈值, 开盘降仓
 
 SYMBOLS = ["BTC/USDT:USDT","ETH/USDT:USDT","DOGE/USDT:USDT"]
-TIERS = {"BTC/USDT:USDT":0.80,"ETH/USDT:USDT":0.80,"DOGE/USDT:USDT":0.60}
-# ─── 山寨币投机通道 ───
-# SOL移入妖币池（波动=妖币级别）
-# 山寨币用 ATR 宽止损 (不做固定%), 顺势动量打法
-# 山寨币移动止盈
-# ─── 妖币扫描 ───
+TIERS = {"BTC/USDT:USDT":0.25,"ETH/USDT:USDT":0.22,"DOGE/USDT:USDT":0.25}  # v27.4: 适配$1300余额 单笔$280-330
+
 
 # ─── Indicators ───
 def rsi(closes, p=14):
@@ -96,6 +75,11 @@ def is_afternoon():
     h = datetime.now(TZ).hour
     return 14 <= h < 17
 
+def is_opening_hours():
+    """v27: 北京时间08:00-10:00 亚盘开盘高波动时段"""
+    h = datetime.now(TZ).hour
+    return 8 <= h < 10
+
 def bollinger(closes, period=20, std=2):
     """布林带: 返回 (mid, upper, lower, width%)"""
     if len(closes)<period: return None,None,None,0
@@ -124,8 +108,7 @@ def load_evolve():
 def save_evolve(data):
     try:
         tmp = str(EVOLVE_FILE) + '.tmp'
-        with open(tmp, 'w') as f: json.dump(data, f)
-        f.flush(); os.fsync(f.fileno())
+        with open(tmp, 'w') as f: json.dump(data, f); f.flush(); os.fsync(f.fileno())
         try: os.replace(tmp, str(EVOLVE_FILE))
         except FileNotFoundError: pass
     except: pass
@@ -150,159 +133,193 @@ def record_signal_result(sig_type, win):
         log(f"🧬 信号降权: {sig_type} 连败{streaks[sig_type]}次 → 权重30%")
 
 # ─── State ───
-MAX_POSITIONS = 1  # 满仓单吊
-MAX_MAIN = 1
-MAX_ALT = 3        # 最多3个山寨/妖币 (总仓位≤$10硬上限)
+MAX_POSITIONS = 5
 @dataclass
 class State:
-    balance: float = START_BALANCE; peak: float = START_BALANCE
+    """轻量复盘容器。余额/持仓100%从API实时读取。"""
     positions: list = field(default_factory=list)
-    trades: int = 0; wins: int = 0; pnl: float = 0.0
+    trades: int = 0; wins: int = 0
     wins_list: list = field(default_factory=list); losses_list: list = field(default_factory=list)
     trade_history: list = field(default_factory=list)
     last_trade: float = 0; melt_until: float = 0
-    day_start_bal: float = START_BALANCE; day_start_t: float = field(default_factory=time.time)
+    day_start_bal: float = 0.0; day_start_t: float = field(default_factory=time.time)
+    testnet_balance: float = 0.0
     stopped: bool = False; sig_stats: dict = field(default_factory=dict)
     startup_time: float = field(default_factory=time.time)
-    consec_losses: int = 0; consec_melt_until: float = 0  # 连亏熔断
-    # 主流统计
+    # v27 风控升级
+    consec_losses: int = 0; consec_melt_until: float = 0
+    dir_losses: dict = field(default_factory=dict)  # {'long':3, 'short':0} 方向连亏计数
+    dir_melt: dict = field(default_factory=dict)     # {'long': timestamp, 'short': 0}
+    consec_history: list = field(default_factory=list)  # 最近50笔: [(ts, win/loss, direction),...]
+    consec_long_losses: int = 0; consec_short_losses: int = 0  # 方向分别计数
+    consec_scan_fails: int = 0  # API全挂计数
+    dir_melt_until: dict = field(default_factory=dict)  # {'long': ts, 'short': ts}
+    bal_fault_count: int = 0  # 余额API连续失败计数
+    last_known_balance: float = 0.0  # 最后一次成功余额
     main_pnl: float = 0.0
     main_trades: int = 0; main_wins: int = 0
-    margin_warn_cooldown: dict = field(default_factory=dict)  # {sym: last_warn_ts}
-    _vol_mult: float = 1.0  # 波动率仓位乘数 保证金不足警告冷却
-
+    main_losses: int = 0  # v27.3: 主流连亏计数
+    _evolve_path: any = None  # v27.2: set in load()
     @property
     def wr(self):
         closed = len(self.wins_list) + len(self.losses_list)
         return len(self.wins_list)/closed if closed else 0.5
 
     def save(self):
-        for retry in range(3):
-            try:
-                d={'v':EVOLVE_VERSION,'balance':self.balance,'peak':self.peak,'trades':self.trades,
-                   'wins':self.wins,'pnl':self.pnl,'wins_list':self.wins_list,
-                   'losses_list':self.losses_list,'trade_history':self.trade_history,
-                   'last_trade':self.last_trade,'melt_until':self.melt_until,
-                   'day_start_balance':self.day_start_bal,'day_start_time':self.day_start_t,
-                   'stopped':self.stopped,'signal_stats':self.sig_stats,
-                   'positions':self.positions,'startup_time':self.startup_time,
-                   'consec_losses':self.consec_losses,'consec_melt_until':self.consec_melt_until,
-                   'main_pnl':self.main_pnl,
-                   'main_trades':self.main_trades,'main_wins':self.main_wins,
-                   'margin_warn_cooldown':getattr(self,'margin_warn_cooldown',{})}
-                # 🔧 原子写入: tmp → fsync → rename
-                tmp=str(STATE_FILE)+'.tmp'
-                with open(tmp,'w') as f:
-                    json.dump(d,f)
-                    f.flush(); os.fsync(f.fileno())
-                try: os.replace(tmp,str(STATE_FILE))
-                except FileNotFoundError: pass
-                return
-            except Exception as e:
-                if retry == 2: log(f"⚠️ save(retry{retry}): {e}")
-                else: time.sleep(0.05)
-
+        """v27.2: 持久化胜率数据到 evolve 文件"""
+        import json as _j
+        try:
+            d = _j.loads(self._evolve_path.read_text()) if self._evolve_path.exists() else {}
+        except: d = {}
+        d['state_snapshot'] = {
+            'wins': len(self.wins_list),
+            'losses': len(self.losses_list),
+            'wins_list': self.wins_list[-200:],
+            'losses_list': self.losses_list[-200:],
+            'day_start_bal': self.day_start_bal,
+            'day_start_t': self.day_start_t,
+            'trades_session': len(self.wins_list) + len(self.losses_list),
+            'last_save': time.time()
+        }
+        try:
+            tmp = str(self._evolve_path) + '.tmp'
+            with open(tmp, 'w') as _f:
+                _j.dump(d, _f)
+                _f.flush(); os.fsync(_f.fileno())
+            os.replace(tmp, str(self._evolve_path))
+        except: pass  # v27.3: 原子写入
     @classmethod
     def load(cls):
-        s=cls()
-        if not STATE_FILE.exists(): return s
+        s = cls()
+        s._evolve_path = BOT_DIR / 'evolve_v25.json'
+        # 从文件恢复持久化数据
         try:
-            with open(STATE_FILE) as f: d=json.load(f)
-            # 简单值: 用 default_value 兜底; dict/list 类型单独处理
-            SIMPLE_KEYS = ['balance','peak','trades','wins','pnl','last_trade','day_start_balance',
-                           'day_start_time','stopped','startup_time','melt_until',
-                           'consec_losses','consec_melt_until',
-                           'main_pnl','main_trades','main_wins']
-            for k in SIMPLE_KEYS:
-                setattr(s, k, d.get(k, getattr(s, k, 0)))
-            DICT_KEYS = ['margin_warn_cooldown']
-            for k in DICT_KEYS:
-                val = d.get(k, {})
-                if isinstance(val, dict):
-                    setattr(s, k, val)
-                else:
-                    setattr(s, k, {})
-            # 同步 day_start_balance → day_start_bal（文件key ≠ 类属性名）
-            s.day_start_bal = getattr(s, 'day_start_balance', s.day_start_bal)
-            for k in ['wins_list','losses_list','trade_history','sig_stats']:
-                setattr(s, k, d.get(k, [] if k!='sig_stats' else {}))
-            if 'positions' in d: s.positions=d['positions']
-            elif 'position' in d and d['position']:  # 迁移旧单持仓
-                p=d['position']; p['trail_active']=False; p['peak_usd']=0
-                s.positions=[p]
+            if s._evolve_path.exists():
+                d = json.loads(s._evolve_path.read_text())
+                snap = d.get('state_snapshot', {})
+                if snap:
+                    s.wins_list = snap.get('wins_list', [])
+                    s.losses_list = snap.get('losses_list', [])
+                    s.day_start_bal = snap.get('day_start_bal', s.day_start_bal)
+                    s.day_start_t = snap.get('day_start_t', s.day_start_t)
         except: pass
-        # 🔧 v25.1: 确保dict类型字段不会被意外覆盖为int
-        for dk in ['margin_warn_cooldown', 'sig_stats']:
-            if not isinstance(getattr(s, dk, {}), dict):
-                setattr(s, dk, {})
-        # ── 从 trade_history 反算所有统计（防重启丢失）──
-        s.trades = len(s.trade_history) + len(s.positions)
-        s.wins = len(s.wins_list)
-        s.pnl = sum(s.wins_list) + sum(s.losses_list)
-        # 反算分类统计
-        s.main_pnl = s.alt_pnl = s.yaobi_pnl = 0.0
-        s.main_wins = s.alt_wins = s.yaobi_wins = 0
-        s.main_trades = s.alt_trades = s.yaobi_trades = 0
-        # 🔧 v25.1: 不再在每次load时重置风控状态，只在真正的新一天重置
-        # 连亏计数从trade_history反算（下面循环中处理）
-        s.alt_losses = s.yaobi_losses = 0  # 先清零，下面反算
-        for t in s.trade_history:
-            pnl = t.get('pnl_u', 0)
-            typ = t.get('type', '')
-            sym = t.get('sym', '')
-            # 推断分类: 妖>寨>主
-            if '妖' in typ:
-                s.yaobi_pnl += pnl; s.yaobi_trades += 1
-                if pnl > 0: s.yaobi_wins += 1
-            elif '山寨' in typ or 'NEAR' in sym or 'AVAX' in sym or 'LINK' in sym or 'APT' in sym or 'ARB' in sym:
-                s.alt_pnl += pnl; s.alt_trades += 1
-                if pnl > 0: s.alt_wins += 1
-            elif sym in ('SOL/USDT',):
-                s.alt_pnl += pnl; s.alt_trades += 1
-                if pnl > 0: s.alt_wins += 1
-            else:
-                s.main_pnl += pnl; s.main_trades += 1
-                if pnl > 0: s.main_wins += 1
         return s
+
+def balance_fn():
+    """从测试网API实时读取U本位可用余额（唯一数据源）
+    v27: 容错增强 - API失败返回None而非0，防止假熔断"""
+    try:
+        b = _testnet_get_balance()
+        if b:
+            free = float(b.get("availableBalance", b.get("balance", 0)))
+            if free >= 0.01:  # 接受任意非零值(0.01兜底, 实际余额通常>1U)
+                state.bal_fault_count = 0  # 成功则清零故障计数
+                state.last_known_balance = free
+                return free
+    except: pass
+    # API失败: 增加故障计数, 返回最后一次已知余额
+    state.bal_fault_count += 1
+    if state.last_known_balance > 0:
+        if state.bal_fault_count <= BALANCE_FAULT_THRESHOLD:
+            log(f"⚠️ 余额API失败(#{state.bal_fault_count}), 使用缓存${state.last_known_balance:.2f}")
+            return state.last_known_balance
+        else:
+            log(f"🚨 余额API连续失败{state.bal_fault_count}次 > {BALANCE_FAULT_THRESHOLD}阈值")
+    return None  # 返回None = 无法获取余额
+
+def api_positions():
+    """从测试网API实时读取持仓列表"""
+    import urllib.request as ub2, ssl as s2, json as j2, hmac as h2, hashlib
+    try:
+        ctx = s2.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = s2.CERT_NONE
+        ts_int = int(time.time() * 1000)
+        q = f'timestamp={ts_int}'
+        sig = h2.new(TESTNET_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+        req = ub2.Request(
+            'https://testnet.binancefuture.com/fapi/v2/positionRisk?' + q + '&signature=' + sig,
+            headers={'X-MBX-APIKEY': TESTNET_KEY})
+        resp = ub2.urlopen(req, timeout=8, context=ctx)
+        data = j2.loads(resp.read())
+        result = []
+        for p in data:
+            amt = float(p.get('positionAmt', 0))
+            if abs(amt) > 0:
+                ep = float(p.get('entryPrice', 0))
+                result.append(dict(
+                    sym=p.get('symbol',''), dir='long' if amt > 0 else 'short',
+                    qty=abs(amt), entry=ep, mark=float(p.get('markPrice',0)),
+                    pnl_u=float(p.get('unRealizedProfit',0)),
+                    time=time.time(), size=abs(amt) * ep / LEVERAGE))
+        return result
+    except Exception as e:
+        log("api_positions error: " + str(e)[:80])
+        return []
 
 state = State.load()
 
-# ─── Exchange ───
 _ex = None
-_ex_fails = 0  # 连续失败计数器
+_ex_fails = 0
 
-_ex_backoff_until = 0  # 连接失败后冷却时间戳
+class _TestnetEx:
+    markets = {}
+    def fetch_ticker(self, sym):
+        import urllib.request as ur2, ssl as s2, json as j2
+        s=sym.split(':')[0].replace('/','')
+        try:
+            r=ur2.urlopen(ur2.Request(f'https://testnet.binancefuture.com/fapi/v1/ticker/price?symbol={s}'),timeout=5,context=s2.create_default_context())
+            d=j2.loads(r.read()); return {'symbol':d['symbol'],'last':float(d['price'])}
+        except: return None
+    def fetch_ohlcv(self, sym, tf='15m', limit=30):
+        import urllib.request as ur2, ssl as s2, json as j2
+        s=sym.split(':')[0].replace('/','')
+        try:
+            r=ur2.urlopen(ur2.Request(f'https://testnet.binancefuture.com/fapi/v1/klines?symbol={s}&interval={tf}&limit={limit}'),timeout=8,context=s2.create_default_context())
+            return [[float(x) for x in k] for k in j2.loads(r.read())]
+        except: return None
+    def fetch_funding_rate(self, sym):
+        import urllib.request as ur2, ssl as s2, json as j2
+        s=sym.split(':')[0].replace('/','')
+        try:
+            r=ur2.urlopen(ur2.Request(f'https://testnet.binancefuture.com/fapi/v1/premiumIndex?symbol={s}'),timeout=5,context=s2.create_default_context())
+            d=j2.loads(r.read())
+            return {'fundingRate': float(d.get('lastFundingRate', 0))}
+        except: return None
+    def create_market_order(self, sym, side, amount, params=None):
+        import urllib.request as ur2, ssl as s2, json as j2, hmac as h2, hashlib
+        s=sym.split(':')[0].replace('/','')
+        ts=int(time.time()*1000); p=f'symbol={s}&side={side.upper()}&type=MARKET&quantity={amount}&timestamp={ts}&recvWindow=5000'
+        sig=h2.new(TESTNET_SECRET.encode(),p.encode(),hashlib.sha256).hexdigest()
+        try:
+            r=ur2.urlopen(ur2.Request(f'https://testnet.binancefuture.com/fapi/v1/order?{p}&signature={sig}',method='POST',headers={'X-MBX-APIKEY':TESTNET_KEY}),timeout=10,context=s2.create_default_context())
+            return j2.loads(r.read())
+        except: return None
+
+def _make_testnet_ex(): return _TestnetEx()
+
+def _testnet_get_balance():
+    """从测试网API拉取余额（直接REST）"""
+    import urllib.request as ub2, ssl as s2, json as j2, hmac as h2, hashlib
+    try:
+        ts = int(time.time() * 1000)
+        q = f"timestamp={ts}&recvWindow=5000"
+        sig = h2.new(TESTNET_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+        req = ub2.Request(
+            f"https://testnet.binancefuture.com/fapi/v2/balance?{q}&signature={sig}",
+            headers={"X-MBX-APIKEY": TESTNET_KEY})
+        ctx = s2.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = s2.CERT_NONE
+        ctx.check_hostname = False; ctx.verify_mode = s2.CERT_NONE
+        resp = ub2.urlopen(req, timeout=8, context=ctx)
+        for b in j2.loads(resp.read()):
+            if b.get("asset") == "USDT":
+                return b
+    except Exception as _be:
+        if int(time.time()) % 300 < 5:  # 5分钟一批日志
+            log(f"⚠️ _testnet_get_balance: {str(_be)[:60]}")
+    return None
 
 def exchange(force=False):
-    global _ex, _ex_fails, _ex_backoff_until
-    now = time.time()
-    # 连接失败冷却中，直接返回None
-    if not force and _ex is None and _ex_fails > 0 and now < _ex_backoff_until:
-        return None
-    if force or _ex is None or _ex_fails > 6:
-        if _ex is not None:
-            try: del _ex
-            except: pass
-        _ex = None
-        _ex_fails = 0
-        for attempt in range(3):
-            try:
-                _ex=ccxt.binance({'apiKey':BINANCE_KEY,'secret':BINANCE_SECRET,
-                    'enableRateLimit':True,'options':{'defaultType':'future'},
-                    'proxies':{'http':PROXY,'https':PROXY},'timeout':8000})
-                _ex.load_markets()
-                _ex_backoff_until = 0  # 成功则清除冷却
-                log(f"📡 {len(_ex.markets)}对" + (" [reconnect]" if force or attempt>0 else ""))
-                break
-            except Exception as e:
-                log(f"⚠️ conn{attempt+1}: {str(e)[:60]}")
-                _ex = None
-                if attempt == 2:
-                    _ex_backoff_until = now + 60  # 最后尝试失败，冷却60秒
-                    log(f"🧊 连接失败3次，冷却60秒")
-                else:
-                    time.sleep(2 ** attempt)  # 指数退避: 1s, 2s
-    return _ex
+    global _ex, _ex_fails
+    return _make_testnet_ex()
 
 def fetch(fn,*a,**kw):
     global _ex_fails
@@ -342,99 +359,139 @@ def price(sym):
                 ex = exchange(force=True)
                 if not ex: continue
             else:
-                time.sleep(min(1.0 ** i + 0.5, 4))  # 增量退避
+                time.sleep(min(1.5 ** i, 4))  # 增量退避
     _ex_fails += 2  # 全部失败大幅加罚，触发外部重建
     return 0
 
-# ─── 实盘交易函数 ───
-BINANCE_KEY = os.environ.get('BINANCE_KEY',os.environ.get('BINANCE_KEY', 'YOUR_API_KEY'))
-BINANCE_SECRET = os.environ.get('BINANCE_SECRET',os.environ.get('BINANCE_SECRET', 'YOUR_SECRET'))
-
-def real_open_order(sig, pos):
-    """实盘开仓, 返回实际成交均价, 失败返回None"""
+# ─── 凭证：从 config.toml 读取，不硬编码 ───
+def _load_config():
     try:
-        ex=exchange()
-        if not ex: return None
-        sym = sig['sym']
-        try: ex.set_leverage(LEVERAGE, sym)
-        except: pass
+        import sys; assert sys.version_info >= (3,11), "Python 3.11+ required for tomllib"
+    except: pass
+    try:
+        import tomllib
+        with open(BOT_DIR / "config.toml", 'rb') as f:
+            return tomllib.load(f)
+    except:
+        return {}
+_cfg = _load_config()
+TESTNET_KEY = _cfg.get('testnet', {}).get('api_key', os.environ.get('TESTNET_KEY',''))
+TESTNET_SECRET = _cfg.get('testnet', {}).get('api_secret', os.environ.get('TESTNET_SECRET',''))
+MACRO_GATE  = _cfg.get('trading', {}).get('macro_gate', True)
+
+# ─── 测试网交易函数 ───
+
+def sim_open_order(sig, pos):
+    import urllib.request as ur2, ssl as s2, json as j2, hmac as h2, hashlib
+    try:
+        sym = sig['sym'].split(':')[0].replace('/','')
+        side = 'BUY' if sig['dir'] == 'long' else 'SELL'
+        margin = pos['size']
+        ctx = s2.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = s2.CERT_NONE
         try:
-            cur_pos = ex.fetch_positions([sym])
-            for cp in cur_pos:
-                if not isinstance(cp, dict): continue
-                c = abs(float(cp.get('contracts',0) or 0))
-                if c < 0.001: continue
-                cur_side = cp.get('side','')
-                if cur_side != sig['dir']:
-                    cls = 'sell' if cur_side == 'long' else 'buy'
-                    ex.create_market_order(sym, cls, c, {'reduceOnly': True})
-                    log(f"🔄 平反向仓位: {cur_side} {sym.split(':')[0]} {c}张")
-        except Exception as e:
-            log(f"⚠️ 检查持仓异常: {str(e)[:60]}")
-        side='buy' if sig['dir']=='long' else 'sell'
-        lev = pos.get('leverage', LEVERAGE)
-        try: ex.set_leverage(lev, sig['sym'])
+            ts0 = int(time.time() * 1000)
+            lp = f'symbol={sym}&leverage={LEVERAGE}&timestamp={ts0}&recvWindow=5000'
+            lsig = h2.new(TESTNET_SECRET.encode(), lp.encode(), hashlib.sha256).hexdigest()
+            ur2.urlopen(ur2.Request(
+                f'https://testnet.binancefuture.com/fapi/v1/leverage?{lp}&signature={lsig}',
+                method='POST', headers={'X-MBX-APIKEY': TESTNET_KEY}), timeout=5, context=ctx)
         except: pass
-        amount=pos['size']*lev/sig['pr']  # margin×杠杆=仓位
-        # 最小名义价值$5 + 最小合约精度
-        min_qty = 0.001 if 'BTC' in sig['sym'] else (1 if 'DOGE' in sig['sym'] else 0.01)
-        if amount*sig['pr']<5.1: amount=5.1/sig['pr']
-        amount = max(amount, min_qty)
-        amount=round(amount, 0) if amount>=1 else amount
-        order=ex.create_market_order(sig['sym'], side, amount)
-        fill_price = float(order.get('average', order.get('price', sig['pr'])))
-        log(f"🔴 实盘开仓: {side} {sig['sym'].split(':')[0]} {amount}个 @{fill_price:.5f}")
-        pos['qty'] = amount  # 记住开仓数量，平仓用同一个
-        return fill_price
+        r = ur2.urlopen(ur2.Request(f'https://testnet.binancefuture.com/fapi/v1/ticker/price?symbol={sym}'), timeout=5, context=ctx)
+        pr = float(j2.loads(r.read())['price'])
+        qty = round(margin * LEVERAGE / pr, 0 if 'DOGE' in sym else 3)
+        if qty < (1 if 'DOGE' in sym else 0.001): qty = (1 if 'DOGE' in sym else 0.001)
+        ts = int(time.time() * 1000)
+        params = f'symbol={sym}&side={side}&type=MARKET&quantity={qty}&timestamp={ts}&recvWindow=5000'
+        sig_hash = h2.new(TESTNET_SECRET.encode(), params.encode(), hashlib.sha256).hexdigest()
+        req = ur2.Request(f'https://testnet.binancefuture.com/fapi/v1/order?{params}&signature={sig_hash}',
+            method='POST', headers={'X-MBX-APIKEY': TESTNET_KEY})
+        resp = ur2.urlopen(req, timeout=10, context=ctx)
+        order = j2.loads(resp.read())
+        actual_price = float(order.get('avgPrice', 0) or order.get('price', pr))
+        if actual_price <= 0:
+            actual_price = pr
+        log(f"🧪 测试网下单: {side} {sym} {qty}个 @{actual_price:.5f}")
+        return actual_price
     except Exception as e:
-        log(f"💥 实盘开仓失败: {str(e)[:100]}")
+        log(f"🧪 下单失败: {str(e)[:80]}")
         return None
 
-def real_close_order(pos, reason):
-    """实盘平仓, 返回实际成交均价, 失败返回None"""
-    try:
-        ex=exchange()
-        if not ex: return None
-        side='sell' if pos['dir']=='long' else 'buy'
-        lev = pos.get('leverage', LEVERAGE)
-        # 优先用开仓时记录的数量，避免浮点截断残留
-        open_qty = pos.get('qty')
-        if open_qty and open_qty > 0:
-            amount = open_qty
-        else:
-            amount=pos['size']*lev/pos['entry']
-            amount=round(amount, 0) if amount>=1 else amount
-        order=ex.create_market_order(pos['sym'], side, amount, {'reduceOnly': True})
-        fill_price = float(order.get('average', order.get('price', pos['entry'])))
-        log(f"🔴 实盘平仓: {side} {pos['sym'].split(':')[0]} {amount}个 @{fill_price:.5f} [{reason}]")
-        return fill_price
-    except Exception as e:
-        log(f"💥 实盘平仓失败: {str(e)[:100]}")
-        return None
+def sim_close_order(pos):
+    """测试网API平仓，返回成交均价，3次重试"""
+    import urllib.request as ur2, ssl as s2, json as j2, hmac as h2, hashlib
+    for attempt in range(3):
+        try:
+            sym = pos['sym'].split(':')[0].replace('/','')
+            side = 'BUY' if pos['dir'] == 'short' else 'SELL'
+            ctx = s2.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = s2.CERT_NONE
+            ts_int = int(time.time() * 1000)
+            qty = pos.get('qty', 0)
+            if qty <= 0:
+                # v27.4: 从API实时查数量
+                real_pos = api_positions()
+                for rp in real_pos:
+                    if rp['sym'].replace('/','') == sym:
+                        qty = rp['qty']
+                        break
+                if qty <= 0:
+                    doge_qty = 'DOGE' in sym
+                    qty = round(pos.get('size', 5) * LEVERAGE / max(pos.get('entry', 1), 0.0001), 0 if doge_qty else 3)
+            if qty < 0.001: qty = 0.001
+            params = 'symbol=' + sym + '&side=' + side + '&type=MARKET&quantity=' + str(qty) + '&timestamp=' + str(ts_int) + '&recvWindow=5000&reduceOnly=true'
+            sig = h2.new(TESTNET_SECRET.encode(), params.encode(), hashlib.sha256).hexdigest()
+            req = ur2.Request('https://testnet.binancefuture.com/fapi/v1/order?' + params + '&signature=' + sig,
+                method='POST', headers={'X-MBX-APIKEY': TESTNET_KEY})
+            resp = ur2.urlopen(req, timeout=10, context=ctx)
+            o = j2.loads(resp.read())
+            if o.get('status') in ('NEW', 'FILLED', 'PARTIALLY_FILLED'):
+                avg = float(o.get('avgPrice', o.get('price', pos.get('entry', 0))))
+                log('🧪 测试网平仓: ' + side + ' ' + sym + ' ' + str(o.get('executedQty')) + '个 @{:.5f}'.format(avg))
+                return avg if avg > 0 else pos.get('entry', 0)
+            else:
+                time.sleep(1)
+        except Exception as e:
+            if attempt == 2:
+                log('🧪 平仓失败(' + str(attempt+1) + '/3): ' + str(e)[:80])
+            time.sleep(1)
+    return None
 
-def real_balance():
-    """U本位合约可用余额（free，不含已锁保证金）"""
-    try:
-        ex=exchange()
-        if not ex: return 0
-        bal = ex.fetch_balance({'type': 'swap'}).get('USDT',{})
-        return float(bal.get('free', 0))
-    except: return 0
-
-# ─── Logging ───
 def ts(): return datetime.now(TZ).strftime("%m-%d %H:%M:%S")
+def _parse_trade_ts(ts_str):
+    """v27: 解析交易历史中的时间戳字符串 → unix时间"""
+    try:
+        dt = datetime.strptime(ts_str, "%m-%d %H:%M:%S")
+        dt = dt.replace(year=datetime.now(TZ).year, tzinfo=TZ)
+        return dt.timestamp()
+    except: return 0
 def log(msg):
     line=f"[{ts()}] {msg}"
     print(line,flush=True)
     try:
         with open(LOG_FILE,'a') as f: f.write(line+'\n')
-        # 🔧 高效轮转: 只在文件过大时截断
-        if f.tell() > MAX_LOG_LINES * 200:
-            with open(LOG_FILE,'r') as fr:
-                lines = fr.readlines()
-            with open(LOG_FILE,'w') as fw:
-                fw.writelines(lines[-MAX_LOG_LINES:])
+        # 日志轮转：超过上限截断
+        lines = LOG_FILE.read_text().split('\n')
+        if len(lines) > MAX_LOG_LINES:
+            LOG_FILE.write_text('\n'.join(lines[-MAX_LOG_LINES:]))
     except: pass
+
+# ─── Macro Gate ───
+def check_macro_gate():
+    """如果宏观风险高，全局禁止开仓"""
+    try:
+        import urllib.request, ssl
+        ctx = ssl.create_default_context()
+        url = "https://api.alternative.me/fng/?limit=1"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = urllib.request.urlopen(req, timeout=8, context=ctx)
+        d = json.loads(resp.read())
+        fng = int(d['data'][0]['value'])
+        if fng <= 15:
+            return False, f"Fear&Greed={fng} 极度恐惧，禁开仓"
+        if fng >= 85:
+            return False, f"Fear&Greed={fng} 极度贪婪，风险高禁开仓"
+        return True, f"Safe FNG={fng}"
+    except Exception as e:
+        return True, f"macro gate skipped ({str(e)[:40]})"
 
 # ─── Signal Scanner ───
 # ─── 周回测集成 ───
@@ -489,22 +546,22 @@ def weekly_alignment_bonus(sym, direction, wb, r1h=None):
     if r1h is not None and r1h < 25:
         return 0
     # 强趋势 (>3%周涨跌) + 近期顺势 → 强加分
-    if direction=='long' and w_change>0.03 and momentum>0:
-        return min(w_change*100*0.8, 20)
+    if direction=='long' and d.get('change',0) > 0.03 and momentum>0:
+        return min(w_change*100*0.6, 15)  # v27: 上限20→15
     elif direction=='short' and w_change<-0.03 and momentum<0:
-        return min(abs(w_change)*100*0.8, 20)
+        return min(abs(w_change)*100*0.6, 15)  # v27: 上限20→15
     # 弱趋势 + 顺势 → 小加分
-    elif direction=='long' and w_change>0:
-        return min(w_change*100*0.3, 8)
+    elif direction=='long' and d.get('change',0) > 0:
+        return min(w_change*100*0.3, 6)  # v27: 上限8→6
     elif direction=='short' and w_change<0:
-        return min(abs(w_change)*100*0.3, 8)
+        return min(abs(w_change)*100*0.3, 6)  # v27: 上限8→6
     # 逆势 → 降分
     elif direction=='long' and w_change<-0.02:
         return -10
-    elif direction=='short' and w_change>0.02:
+    elif direction=='short' and d.get('change',0) > 0.02:
         return -10
     # 高波动 + 逆势 = 更大降分
-    if vol>0.05 and ((direction=='long' and w_change<0) or (direction=='short' and w_change>0)):
+    if vol>0.05 and ((direction=='long' and w_change<0) or (direction=='short' and d.get('change',0) > 0)):
         return -15
     return 0
 
@@ -529,8 +586,8 @@ def dynamic_tier(sym, cl, vols):
     recent_vol = sum(rets[-5:])/5 if rets else 0.005
     avg_vol = sum(rets)/len(rets) if rets else 0.005
     vr = recent_vol / max(avg_vol, 0.001)  # 波动率比
-    if vr > 2.5: return base_tier * 0.6   # 极端波动 → 降40%
-    elif vr > 1.8: return base_tier * 0.8
+    if vr > 2.0: return base_tier * 0.5   # 高波动 → 半仓
+    elif vr > 1.5: return base_tier * 0.7
     elif vr < 0.5: return min(base_tier*1.5, 0.6)  # 低波动 → 加仓(上限60%)
     return base_tier
 
@@ -544,10 +601,10 @@ def sentiment_overlay(sym, direction, wb):
     momentum = d.get('momentum',0)
     # 方向一致性
     trend_score = 0
-    if direction=='long' and w_change>0: trend_score = min(w_change*100, 20)
+    if direction=='long' and d.get('change',0) > 0: trend_score = min(w_change*100, 20)
     elif direction=='short' and w_change<0: trend_score = min(abs(w_change)*100, 20)
     elif direction=='long' and w_change<0: trend_score = max(w_change*100, -20)
-    elif direction=='short' and w_change>0: trend_score = max(-w_change*100, -20)
+    elif direction=='short' and d.get('change',0) > 0: trend_score = max(-w_change*100, -20)
     mom_score = max(min(momentum*200, 10), -10)  # 近3日动量
     if direction=='short': mom_score = -mom_score
     return round(trend_score*0.6 + mom_score*0.4, 1)
@@ -576,7 +633,10 @@ def funding_signal(ex, sym):
 
 def scan():
     ex=exchange()
-    if not ex: return []
+    if not ex:
+        state.consec_scan_fails += 1  # v27.3: +1用于API全挂检测
+        return []
+    state.consec_scan_fails = max(0, state.consec_scan_fails - 1)  # 成功则递减
     wb = wb_fresh(ex)  # 获取最新周回测
     sigs=[]
     for sym in SYMBOLS:
@@ -594,33 +654,47 @@ def scan():
                 log(f"⚠️ {sym} 量异常 → 跳过")
                 continue
             
-            # 4h趋势过滤: 价格 vs EMA(20)
-            o4=fetch(ex.fetch_ohlcv,sym,'4h',limit=30)
+            # 4h趋势过滤: EMA50>EMA200 (EasyTrendline学来)
+            o4=fetch(ex.fetch_ohlcv,sym,'4h',limit=210)
             trend_up = None  # None=趋势未知，两端信号都跳过
-            if o4 and len(o4)>=21:
-                ema4 = sum(c[4] for c in o4[-20:])/20
-                trend_up = pr > ema4  # 价格在EMA上方=上升趋势
+            if o4 and len(o4)>=201:
+                closes=[c[4] for c in o4]
+                ema50 = sum(closes[-50:])/50
+                ema200 = sum(closes)/200
+                trend_up = ema50 > ema200 and pr > ema50  # 牛市: 50在200上方且价格在50上方
+            
+            # RSI-SMA动量过滤 (EasyTrendline: 避免弱反弹)
+            rsi_sma = sum([rsi([c[4] for c in o1[-i-14:-i] or [c[4]]*14]) for i in range(14)])/14 if o1 and len(o1)>=28 else 50
+            momentum_ok = r15 > rsi_sma - 3  # RSI高于其SMA(14) → 动量健康
 
-            # LONG 信号 (需要量 + 趋势确认)
+            # LONG 信号 (需要量 + 趋势确认 + 动量健康)
             ok,s=divergence(cl,'bullish')
-            if ok and r15<58 and r1h<62 and trend_up is True:
+            if ok and r15<58 and r1h<62 and trend_up is True and momentum_ok:
                 if not vol_ok: pass  # 背离无量直接跳过
                 else:
                     sc=s*2.5+(58-r15)*0.8
                     sc*=signal_weight('RSI背离(L)')
                     sigs.append({'sym':sym,'pr':pr,'dir':'long','sc':round(sc,1),'type':'RSI背离(L)','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
+            # v27: 超卖反转 — 仅允许牛市或趋势未知(趋势未知时扣10分)，熊市禁止抄底
             if r15<35:
-                # 🔧 RSI拐头确认: 当前RSI > 前一根RSI (拒绝继续下跌)
-                r15_prev = rsi(cl[:-1]) if len(cl)>20 else r15
-                if r15 <= r15_prev and r15 < 25:
-                    log(f"⏸️ {sym.split(':')[0]} r15={r15:.1f} 仍在下跌 → 等拐头")
-                    pass  # 跳过，等RSI止跌回升
-                else:
-                    log(f"🔔 {sym.split(':')[0]} r15={r15:.1f}<35 超卖! sc={(35-r15)*4+15:.0f}")
+                if trend_up is True:
                     sigs.append({'sym':sym,'pr':pr,'dir':'long','sc':round((35-r15)*4+15,1),'type':'超卖反转','r15':round(r15,1),'r1h':round(r1h,1)})
+                elif trend_up is None:
+                    sigs.append({'sym':sym,'pr':pr,'dir':'long','sc':round((35-r15)*4+5,1),'type':'超卖反转','r15':round(r15,1),'r1h':round(r1h,1)})
             if r1h<42 and r15>r1h+5 and r15<50 and ma200 and pr>ma200:
                 sc=((42-r1h)*1.5+(r15-r1h)*2+5)*signal_weight('多TF均值回归')
                 sigs.append({'sym':sym,'pr':pr,'dir':'long','sc':round(sc,1),'type':'多TF均值回归','r15':round(r15,1),'r1h':round(r1h,1)})
+            # 🚀 追涨多头: RSI>55 + 周线涨 + 量确认 + 价格高于MA200
+            wdata = wb.get(sym.split(":")[0], {})
+            if r15>55 and trend_up is True and vol_ok and ma200 and pr>ma200 and wdata.get('change',0) > 0:
+                sc=min((r15-55)*3 + wdata.get('change',0)*100*80 + 15, 100)  # CAP 100
+                sc*=signal_weight('追涨动量')
+                sigs.append({'sym':sym,'pr':pr,'dir':'long','sc':round(sc,1),'type':'追涨动量','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
+            # 🔻 追跌空头: RSI 30-55 + 周线跌 + 量确认 + 价格低于MA200
+            if r15<55 and r15>30 and trend_up is False and vol_ok and ma200 and pr<ma200 and wdata.get('change',0) < 0:
+                sc=min((55-r15)*3 + abs(wdata.get('change',0))*100*2 + 15, 100)
+                sc*=signal_weight('追跌动量(S)')
+                sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round(sc,1),'type':'追跌动量(S)','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
 
             # SHORT 信号 (需要量 + 趋势确认)
             ok,s=divergence(cl,'bearish')
@@ -630,22 +704,30 @@ def scan():
                     sc=s*2.5+(r15-42)*0.8
                     sc*=signal_weight('RSI背离(S)')
                     sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round(sc,1),'type':'RSI背离(S)','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
-            if r15>65:
-                log(f"🔔 {sym.split(':')[0]} r15={r15:.1f}>65 超买! sc={(r15-65)*4+15:.0f}")
-                sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round((r15-65)*4+15,1),'type':'超买反转','r15':round(r15,1),'r1h':round(r1h,1)})
-            if r1h>58 and r15<r1h-5 and r15>50:
+            if r15>68 and trend_up is False:
+                log(f"🔔 {sym.split(':')[0]} r15={r15:.1f}>65 超买! sc={(r15-65)*3+25:.0f}")
+                sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round((r15-65)*3+25,1),'type':'超买反转','r15':round(r15,1),'r1h':round(r1h,1)})
+            if r1h>58 and r15<r1h-5 and r15>50 and trend_up is False:
                 sc=((r1h-58)*1.5+(r1h-r15)*2+5)*signal_weight('多TF均值回归')
                 sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round(sc,1),'type':'多TF均值回归','r15':round(r15,1),'r1h':round(r1h,1)})
+            # v27: 🐻 强趋势跟随做空 — 熊市中RSI续跌(不在极端低点) → 顺势做空
+            if trend_up is False and r15<55 and r15>25 and r1h<55 and r1h>25:
+                # RSI正在下降(15m < 1h) + 趋势向下 → 确认下跌动量
+                rsi_falling = r15 < r1h
+                if rsi_falling:
+                    sc = 20 + (55-r15)*1.2 + (55-r1h)*1.0  # RSI越低→趋势越弱→分越低
+                    if vol_ok: sc *= 1.2  # 量确认加分
+                    sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round(sc,1),'type':'趋势跟随(S)','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
             
             # ── 横盘专用: BB反弹 (RSI中性区间 + 低波动) ──
             if 40<r15<60 and 38<r1h<62:
                 mid, upper, lower, bbw = bollinger(cl)
                 if mid and bbw>0 and bbw<4:
-                    if pr <= lower*1.001 and r15>38:
+                    if pr <= lower*1.001 and r15>38 and trend_up is not False:  # 🔧 v27.2: 下跌趋势禁止BB下轨做多
                         sc = 25 + (lower-pr)/lower*100*80 + (r15-38)*1.0
                         if vol_ok: sc *= 1.3
                         sigs.append({'sym':sym,'pr':pr,'dir':'long','sc':round(sc,1),'type':'BB反弹(L)','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
-                    elif pr >= upper*0.999 and r15<62:  # elif防止同币种双向触发
+                    elif pr >= upper*0.999 and r15<62 and trend_up is False:  # elif防止同币种双向触发
                         sc = 25 + (pr-upper)/upper*100*80 + (62-r15)*1.0
                         if vol_ok: sc *= 1.3
                         sigs.append({'sym':sym,'pr':pr,'dir':'short','sc':round(sc,1),'type':'BB反弹(S)','r15':round(r15,1),'r1h':round(r1h,1),'vol_r':round(vol_ratio,2)})
@@ -672,25 +754,23 @@ def scan():
                 sigs.append({'sym':sym,'pr':tick.get('last',0),'dir':fs_dir,'sc':round(fs_sc+20,1),
                     'type':'资金费率','r15':0,'r1h':0,'vol_r':0,'fr':True})
 
-    # 🔧 顺势过滤: 周跌→只做空, 周涨→只做多, 横盘→双开
-    wb_data = wb
-    def trend_ok(s):
-        chg = wb_data.get(s['sym'].split('/')[0],{}).get('change', 0)
-        name = s['sym'].split('/')[0]
-        if chg < -0.03 and s['dir'] == 'long':
-            log(f"🚫 {name} 周跌{chg*100:.0f}% → 只做空不做多")
-            return False
-        if chg > 0.03 and s['dir'] == 'short':
-            log(f"🚫 {name} 周涨{chg*100:.0f}% → 只做多不做空")
-            return False
-        return True
-    sigs = [s for s in sigs if trend_ok(s)]
 
     sigs.sort(key=lambda x:-x['sc'])
     seen={}
     for s in sigs:
         k=(s['sym'],s['dir'])
         if k not in seen: seen[k]=s
+
+    # 🀄 命理增强 ±12分
+    try:
+        divine = fengshui_bonus()
+        if divine != 0:
+            for s in seen.values():
+                s['sc'] = round(s['sc'] + divine, 1)
+            log(f"🀄 命理: {divine:+d}分")
+    except Exception as e:
+        log(f"🀄 命理异常: {str(e)[:60]}")
+
     # 止损冷却过滤 (freqtrade StopLossGuard学来)
     filtered = []
     for s in sorted(seen.values(), key=lambda x:-x['sc']):
@@ -698,112 +778,149 @@ def scan():
         if on_cd:
             log(f"⏳ {s['sym']} {s['dir']} 止损冷却中 ({cd_min:.0f}分) → 跳过")
             continue
+        # v27: 方向熔断过滤
+        dir_melt = state.dir_melt_until.get(s['dir'], 0)
+        if dir_melt > 0 and time.time() < dir_melt:
+            remaining = (dir_melt - time.time()) / 60
+            log(f"🚫 {s['sym']} {s['dir']} 方向熔断中 ({remaining:.0f}分) → 跳过")
+            continue
         filtered.append(s)
-    return sorted([s for s in filtered if s['sc']>=MIN_SCORE], key=lambda x:-x['sc'])
+    # v27: 自适应信号阈值 — 根据市场状态动态调整
+    wb_summary = _wb_cache if _wb_cache else {}
+    avg_w_change = 0
+    count = 0
+    for d in wb_summary.values():
+        if isinstance(d, dict) and 'change' in d:
+            avg_w_change += d['change']; count += 1
+    avg_w_change = avg_w_change / max(count, 1)
+    if abs(avg_w_change) > 0.05:
+        active_min = MIN_SCORE_BEAR  # 熊市/牛市加剧 → 门槛55
+    elif abs(avg_w_change) > 0.03:
+        active_min = MIN_SCORE  # 温和趋势 → 门槛45
+    else:
+        active_min = MIN_SCORE_BULL  # 横盘 → 门槛42
+    return sorted([s for s in filtered if s['sc']>=active_min], key=lambda x:-x['sc'])
 
-# 📝 扫描汇总留痕
-def _log_scan_summary(sigs, filtered, min_score):
-    total = len(sigs)
-    above = sum(1 for s in sigs if s['sc'] >= min_score)
-    below = total - above
-    if total > 0 and above == 0:
-        top3 = sorted(sigs, key=lambda x:-x['sc'])[:3]
-        names = ', '.join(f"{s['sym'].split(':')[0]}({s['sc']:.0f})" for s in top3)
-        log(f"📊 扫描: {total}信号 过{min_score}分:0 | TOP3[{names}] 全部未达标")
-
-# ─── 山寨币扫描 (简化版: RSI极值+量确认) ───
 def open_trade(sig):
     log(f"🔴 open_trade called: {sig['dir']} {sig['sym']} [{sig['type']}] sc:{sig['sc']}")
-    # 🚫 硬白名单: 只允许主流币
-    sym_raw = sig['sym'].split(':')[0].replace('/','')
-    if sym_raw not in ('BTCUSDT','ETHUSDT','DOGEUSDT'):
-        log(f"🚫 {sig['sym']} 非白名单 → 跳过")
-        return
-    # 仓位上限 + 防同币同向重复
+    # 🧠 DeepSeek AI 决策引擎 (8秒超时，注入余额/连亏/方向状态)
+    try:
+        import subprocess as _sp
+        sig_copy = dict(sig)
+        sig_copy['consec_losses'] = state.consec_losses
+        wl, ll = state.wins_list, state.losses_list
+        sig_copy['recent_wr'] = round(len(wl)/max(len(wl)+len(ll),1)*100)
+        sig_copy['balance'] = round(balance_fn() or 0, 2)
+        sig_copy['positions'] = len(state.positions)
+        sig_copy['dir_melt_long'] = state.dir_melt.get('long', 0) > time.time()
+        sig_copy['dir_melt_short'] = state.dir_melt.get('short', 0) > time.time()
+        r = _sp.run([sys.executable, str(BOT_DIR/'deepseek_engine.py')],
+                    input=json.dumps(sig_copy), capture_output=True, text=True, timeout=8)
+        ai_decision = (r.stdout or '').strip()
+        if ai_decision.startswith('REJECT'):
+            log(f"🤖 AI拒绝: {ai_decision}")
+            return
+        elif ai_decision.startswith('APPROVE'):
+            log(f"🤖 AI批准: {ai_decision[8:] if len(ai_decision)>8 else '通过'}")
+        else:
+            log(f"🤖 AI超时/降级: 半仓执行")
+            # 超时降为半仓，不拒绝
+            sig['_ai_reduced'] = True
+    except Exception as e:
+        log(f"🤖 AI异常,半仓执行: {str(e)[:50]}")
     if len(state.positions)>=MAX_POSITIONS: return
     key=(sig['sym'],sig['dir'])
     for p in state.positions:
         if (p['sym'],p['dir'])==key: return
-    # 🔧 相关性过滤: BTC+ETH 不同向开双仓
-    sym_name = sig['sym'].split('/')[0]
-    if sym_name in ('BTC','ETH'):
-        other = 'ETH/USDT:USDT' if sym_name=='BTC' else 'BTC/USDT:USDT'
-        for p in state.positions:
-            if p['sym']==other and p['dir']==sig['dir']:
-                log(f"🔗 {sym_name} {sig['dir']} 已有 {other.split('/')[0]} 同向 → 跳过")
-                return
-    cat='main'
-    # 分类上限检查
-    main_n = sum(1 for p in state.positions if p.get('cat')=='main')
-    if main_n>=MAX_MAIN: return
-    tier = TIERS.get(sig['sym'],0.40)
-    # 动态仓位: 高波动降仓
+    d = sig['dir']
+    if state.dir_melt.get(d, 0) > time.time():
+        remaining = int((state.dir_melt[d] - time.time()) / 60)
+        if int(time.time()) % 120 < SCAN_INTERVAL:  # throttle log
+            log(f"🚫 {d}方向熔断中 (剩余{remaining}分)")
+        return
+    tier = TIERS.get(sig['sym'], 0.40)
+    # 动态仓位 (Jesse Kelly adaptation): 高波动降仓
     ex2=exchange()
     if ex2:
         o2=fetch(ex2.fetch_ohlcv,sig['sym'],'15m',limit=30)
         if o2:
             tier = dynamic_tier(sig['sym'],[c[4] for c in o2],[c[5] for c in o2])
+    # v25.4: 下午14-17点仓位减半（低流动性高波动）
     afternoon_mult = 0.5 if is_afternoon() else 1.0
-    sz_raw = round(min(state.balance, real_balance()) * dynamic_size_mult(sig['sc']) * getattr(state, '_vol_mult', 1.0), 2)
-    # 🔬 VaR风控: 仓位不超过VaR限制
-    var_limit = getattr(state, '_var_limit', state.balance)
-    sz_raw = min(sz_raw, var_limit)
-    sz=sz_raw
-    min_sz = max(state.balance * 0.08, 3.0)  # 最低仓位=余额8%, 硬下限$3
-    # BTC最低精度0.001 → 需margin≥$3.93(20x)
-    if 'BTC' in sig['sym']: min_sz = max(min_sz, 4.0)
-    if sz<min_sz: sz=round(min_sz,2)
-    pos={'sym':sig['sym'],'entry':sig['pr'],'size':sz,'time':time.time(),
-        'dir':sig['dir'],'type':sig['type'],'score':sig['sc'],'cat':cat,
-        'leverage':dynamic_leverage(sig['sc']),
-        'sl_pct':adaptive_sl(sig['sc'])[0], 'max_loss':adaptive_sl(sig['sc'])[1],
-        'trail_active':False,'peak_usd':0}
-    # 开仓前检查保证金
-    total_margin_needed = sum(p['size'] for p in state.positions) + sz
-    free_bal = real_balance()
-    # 开仓前检查保证金（满仓模式：sz已按free_bal限制，跳过）
-    if False and free_bal is not None and total_margin_needed > free_bal:
-        sym_short = sig['sym'].split(':')[0]
-        now = time.time()
-        mwc = getattr(state, 'margin_warn_cooldown', None)
-        if not isinstance(mwc, dict):
-            state.margin_warn_cooldown = {}
-            mwc = state.margin_warn_cooldown
-        last_warn = mwc.get(sym_short, 0)
-        if now - last_warn > 300:
-            log(f"⚠️ 保证金不足: 需{total_margin_needed:.1f}U 可用{free_bal:.1f}U | 跳过 {sym_short}")
-            state.margin_warn_cooldown[sym_short] = now
+    # v27: 开盘时段自动降仓 (08:00-10:00 亚盘高波动 → 25%仓位)
+    opening_mult = 0.25 if is_opening_hours() else 1.0
+    effective_mult = min(afternoon_mult, opening_mult)  # 取最严格的降仓系数
+    bal = balance_fn()
+    if bal is None or bal <= 0:
+        log(f"⚠️ 余额不可用 → 跳过开单")
         return
+    sz_raw = round(bal * tier * (0.75 if is_weekend() else effective_mult), 2)  # v27.3: 修复运算符优先级bug
+
+    sz=sz_raw
+    # sz = 名义价值(仓位), 最低$5
+    if sz<3: sz=3.0
+    pos={'sym':sig['sym'],'entry':sig['pr'],'size':sz,'time':time.time(),
+        'dir':sig['dir'],'type':sig['type'],'score':sig['sc'],
+        'trail_active':False,'peak_usd':0}
+    if not validate_trade(sig, pos): return
     state.positions.append(pos)
     state.last_trade=time.time(); state.trades+=1
     log(f"🔫 开单确认: {sig['dir']} {sig['sym']} sz:{sz}U sc:{sig['sc']} [{sig['type']}]")
-    # 📝 策略决策完整日志
-    sym_name = sig['sym'].split(':')[0]
-    wb_data = wb_fresh(exchange()) if exchange() else {}
-    wb_coin = wb_data.get(sym_name, {})
-    wb_chg = wb_coin.get('change', 0) if wb_coin else 0
-    trend_info = f"周{'+' if wb_chg>=0 else ''}{wb_chg*100:.0f}%"
-    regime_info = sig.get('hmm_regime', '?')
-    regime_names = ['🐻跌','📊横','🐂涨']
-    regime_str = regime_names[min(int(regime_info) if isinstance(regime_info, (int,float)) else 1, 2)]
-    var_limit = getattr(state, '_var_limit', 0)
-    vol_mul = getattr(state, '_vol_mult', 1.0)
-    log(f"📋 策略决策: {sym_name} {sig['dir'].upper()} | se:{sig['sc']:.1f} | 20x | {sig['type']} | {trend_info} | HMM:{regime_str} | RSI15:{sig.get('r15','?')} | VaR:{var_limit:.1f} | VolMul:{vol_mul:.1f}")
-    # 🔧 费用检查: 预期利润必须覆盖手续费
-    fee_estimate = sz * LEVERAGE * 0.0008
-    min_profit_needed = fee_estimate * 1.5  # 至少覆盖1.5倍手续费才有意义
-    log(f"📋 费用评估: 手续费${fee_estimate:.2f} | 保本需利润≥${min_profit_needed:.2f} | 余额:{state.balance:.2f}")
-    fill_price = real_open_order(sig, pos)
+    fill_price = sim_open_order(sig, pos)
     if fill_price is None:
         log(f"💥 开单API失败 → 回滚")
         state.positions.pop(); state.trades-=1; state.save(); return
-    pos['entry'] = fill_price
+    pos['entry'] = fill_price  # 用实际成交价, 非OHLCV信号价
     state.main_trades+=1
     em='🚀' if sig['dir']=='long' else '🔻'
     vi=f" vol:{sig.get('vol_r',1):.1f}x" if 'vol_r' in sig else ""
-    chg_info = f" 24h:{sig['chg']:+.0f}%" if sig.get('chg') else ""
-    log(f"🔷{em} {sig['dir'].upper()} {sig['sym'].split(':')[0]} @{sig['pr']:.2f} x{pos.get('leverage',LEVERAGE)} {sz}U | {sig['type']} sc:{sig['sc']:.1f}{vi}{chg_info} [{len(state.positions)}/{MAX_POSITIONS}]")
+    log(f"🔷{em} {sig['dir'].upper()} {sig['sym'].split(':')[0]} @{sig['pr']:.2f} x{LEVERAGE} {sz}U | {sig['type']} sc:{sig['sc']:.1f}{vi} [{len(state.positions)}/{MAX_POSITIONS}]")
     state.save()
+
+def validate_trade(sig, pos):
+    """三层校验: 参数/RSI/EMA"""
+    # 1. 参数校验
+    required_sig = ['sym', 'pr', 'dir', 'sc', 'type']
+    for k in required_sig:
+        if k not in sig or sig[k] is None:
+            log(f"❌ validate: sig缺少字段 {k}")
+            return False
+    required_pos = ['sym', 'entry', 'size', 'dir']
+    for k in required_pos:
+        if k not in pos or pos[k] is None:
+            log(f"❌ validate: pos缺少字段 {k}")
+            return False
+    if sig['pr'] <= 0 or pos['size'] <= 0:
+        log(f"❌ validate: 无效价格/仓位 pr={sig['pr']} sz={pos['size']}")
+        return False
+    if sig['sym'] != pos['sym'] or sig['dir'] != pos['dir']:
+        log(f"❌ validate: sig/pos方向不一致")
+        return False
+    # 2. RSI校验: 不在极端区域开反向单
+    r15 = sig.get('r15', 50)
+    if sig['dir'] == 'long' and r15 > 80:
+        log(f"❌ validate: RSI={r15:.1f} 超买区不做多")
+        return False
+    if sig['dir'] == 'short' and r15 < 20:
+        log(f"❌ validate: RSI={r15:.1f} 超卖区不做空")
+        return False
+    # 3. EMA校验: 价格与EMA(20)关系
+    try:
+        ex = exchange()
+        if ex:
+            o = fetch(ex.fetch_ohlcv, sig['sym'], '15m', limit=30)
+            if o and len(o) >= 21:
+                cl = [c[4] for c in o]
+                ema20 = sum(cl[-20:]) / 20
+                if sig['dir'] == 'long' and sig['pr'] < ema20 * 0.97:
+                    log(f"❌ validate: 价格{sig['pr']:.2f}远低于EMA{ema20:.2f} → 不做多")
+                    return False
+                if sig['dir'] == 'short' and sig['pr'] > ema20 * 1.03:
+                    log(f"❌ validate: 价格{sig['pr']:.2f}远高于EMA{ema20:.2f} → 不做空")
+                    return False
+    except Exception as e:
+        log(f"⚠️ validate EMA校验异常: {e} → 放行")
+    return True
 
 def close_trade(pos, reason, exit_price=None):
     if not pos: return
@@ -812,60 +929,82 @@ def close_trade(pos, reason, exit_price=None):
         p=pos; nm=p['sym'].split(':')[0]
         if exit_price is None: exit_price=price(p['sym'])
         if not exit_price or exit_price<=0:
-            if time.time()-p['time']>1200: exit_price=p['entry']
+            if time.time()-p.get('time', time.time())>1200: exit_price=p['entry']
             else: return
-        # 实盘平仓, 用实际成交价替代OHLCV价格
-        fill_price = real_close_order(pos, reason)
-        if fill_price is not None:
-            exit_price = fill_price
-        else:
-            # ⚠️ 平仓API失败：仓位可能还在交易所，恢复持仓
-            log(f"⚠️ 平仓失败 [{reason}] → 恢复持仓")
-            state.positions.append(pos)
-            state.trades -= 1
+        # 测试网API平仓
+        fill_price = sim_close_order(pos)
+        if fill_price is None:
+            log(f"❌ 测试网平仓API失败 → 保留持仓 {nm}")
             return
-        # 先从持仓列表移除
+        exit_price = fill_price  # API返回的成交价
         if pos in state.positions: state.positions.remove(pos)
         pnl_pct=((exit_price-p['entry'])/p['entry']*100) if p['dir']=='long' else ((p['entry']-exit_price)/p['entry']*100)
-        pnl_u=pnl_pct/100*p['size']*p.get('leverage', LEVERAGE)
-        # 🔧 扣除双向手续费 (0.04%×2=0.08% 名义价值)
-        fee_rt = p['size'] * p.get('leverage', LEVERAGE) * 0.0008
-        pnl_u -= fee_rt
+        pnl_u=pnl_pct/100*p.get('size', 0)*LEVERAGE
         if abs(pnl_u)<0.0005: state.trades-=1; state.save(); return
-        state.balance+=pnl_u; state.pnl+=pnl_u
         win=pnl_u>0
         if win: state.wins+=1; state.wins_list.append(pnl_u); state.consec_losses=0
         else: state.losses_list.append(pnl_u); state.consec_losses+=1
+        d = p.get('dir','long')
+        if not win:
+            state.dir_losses[d] = state.dir_losses.get(d,0) + 1
+        else:
+            state.dir_losses[d] = 0
+            if d in state.dir_melt: del state.dir_melt[d]
+        if state.dir_losses.get(d,0) >= 3:
+            state.dir_melt[d] = time.time() + 3600
+            log(f"🛑 {d}方向连亏{state.dir_losses[d]}笔 → 暂停{d}方向1小时")
+        # 滑动窗口记录
+        state.consec_history.append((time.time(), win, p['dir']))
+        if len(state.consec_history) > 50:
+            state.consec_history = state.consec_history[-50:]
+        if not win:
+            if p['dir'] == 'long': state.consec_long_losses += 1
+            else: state.consec_short_losses += 1
+        else:
+            if p['dir'] == 'long': state.consec_long_losses = 0
+            else: state.consec_short_losses = 0
         st=p.get('type','?')
-        # ── 统计 ──
+        # 分类统计
         state.main_pnl+=pnl_u
         if win: state.main_wins+=1; state.consec_losses=0
         else:
-            if state.consec_losses >= MAX_CONSEC_LOSSES:
-                state.consec_melt_until=time.time()+CONSEC_COOLDOWN
-                log(f"🛑 连亏{state.consec_losses}笔 → 冷却{CONSEC_COOLDOWN//60}分")
+            state.main_losses += 1
+            window_losses = sum(1 for h in state.consec_history if not h[1])
+            cooldown_sec = CONSEC_COOLDOWN_BASE
+            for (n, cd) in sorted(CONSEC_COOLDOWN_TIERS, reverse=True):
+                if window_losses >= n:
+                    cooldown_sec = cd; break
+            if window_losses >= MAX_CONSEC_LOSSES:
+                state.consec_melt_until=time.time()+cooldown_sec
+                log(f"🛑 窗口连亏{window_losses}笔 → 冷却{cooldown_sec//60}分")
+            if p['dir'] == 'long' and state.consec_long_losses >= 3:
+                state.dir_melt_until['long'] = time.time() + 3600
+                log(f"🚫 LONG连亏{state.consec_long_losses}笔 → 暂停做多1h")
+            elif p['dir'] == 'short' and state.consec_short_losses >= 3:
+                state.dir_melt_until['short'] = time.time() + 3600
+                log(f"🚫 SHORT连亏{state.consec_short_losses}笔 → 暂停做空1h")
         d=state.sig_stats.setdefault(st,[0,0])
         d[0]+=1 if win else 0; d[1]+=0 if win else 1
-        state.trade_history.append({'sym':nm,'dir':p['dir'],'entry':round(p['entry'],2),
+        ep_rec = p.get('entry', 0)
+        state.trade_history.append({'sym':nm,'dir':p['dir'],'entry':round(ep_rec, 2 if ep_rec > 1 else 5),
             'exit':round(exit_price,2),'pnl_pct':round(pnl_pct,2),'pnl_u':round(pnl_u,2),
             'type':st,'reason':reason,'time':ts(),'score':p.get('score',0)})
         if len(state.trade_history)>200: state.trade_history=state.trade_history[-200:]
         record_signal_result(st, win)
         state.last_trade=time.time()
-        if state.balance>state.peak: state.peak=state.balance
         e='✅' if pnl_u>0 else '❌'
-        log(f"{e} {p['dir']} {nm} {p['entry']:.2f}→{exit_price:.2f} PnL:{pnl_pct:+.2f}%×{p.get('leverage',LEVERAGE)}x=${pnl_u:+.2f} [{reason}]")
-        # 📝 平仓复盘留痕
-        fee_detail = p['size'] * p.get('leverage', LEVERAGE) * 0.0008
-        log(f"📋 平仓复盘: {nm} {p['dir']} | 开{p['entry']:.4f} 平{exit_price:.4f} | 毛利${pnl_u+fee_detail:+.2f} 费${fee_detail:.2f} 净${pnl_u:+.2f} | sc:{p.get('score','?')} [{reason}]")
-        log(f"   ${state.balance:.2f} | {state.trades}t {state.wins}w({state.wr*100:.0f}%)")
+        log(f"{e} {p['dir']} {nm} {p['entry']:.2f}→{exit_price:.2f} PnL:{pnl_pct:+.2f}%×{LEVERAGE}x=${pnl_u:+.2f} [{reason}]")
         state.save()
-    except Exception:
-        log(f"💥 close_trade异常 [{reason}] | pos={nm}")
-        if pos in state.positions: state.positions.remove(pos)
+    except Exception as _cte:
+        log(f"💥 close_trade异常 [{reason}] | pos={nm} | err={str(_cte)[:80]}")
         state.save()
-
 def check_positions():
+    if not state.positions:
+        # v27.4: state.positions为空时从API强制同步
+        real = api_positions()
+        if real:
+            state.positions = real
+            log(f"🔄 state.positions为空，从API恢复{len(real)}笔持仓")
     for p in list(state.positions):
         _check_one(p)
 
@@ -875,306 +1014,289 @@ def _check_one(p):
         if p in state.positions: state.positions.remove(p)
         state.save()
         return
-    elapsed=time.time()-p['time']; pr=price(p['sym'])
+    elapsed=time.time()-p.get('time', time.time())
+    if 'time' not in p: p['time'] = time.time()  # 补time字段防崩溃
+    pr=price(p['sym'])
     if not pr or pr<=0:
         if int(elapsed)%120<SCAN_INTERVAL and elapsed>60: log(f"⚠️ {p['sym']} 价格获取失败 {elapsed/60:.0f}m")
         return
     pnl_pct=((pr-p['entry'])/p['entry']*100) if p['dir']=='long' else ((p['entry']-pr)/p['entry']*100)
-    usd=pnl_pct/100*p['size']*p.get('leverage',LEVERAGE)
-    # 🔧 扣除双向手续费 (0.04%×2=0.08% 名义价值)
-    fee_rt = p['size'] * p.get('leverage', LEVERAGE) * 0.0008
-    usd_net = usd - fee_rt  # 真实净盈亏
+    if 'size' not in p and 'qty' in p: p['size'] = p['qty'] * p['entry'] / LEVERAGE
+    usd=pnl_pct/100*p.get('size', p.get('qty',1))*LEVERAGE
     if usd>p.get('peak_usd',0): p['peak_usd']=usd
 
-    # ── 退出逻辑 ──
-    # v27: 自适应止损 + ATR动态SL
-    max_loss = p.get('max_loss', MAX_SINGLE_LOSS)
-    sl_pct = p.get('sl_pct', SL)
-    # 🔧 ATR动态SL: 高波动=宽止损, 低波动=紧止损
-    try:
-        sym_key = p['sym']
-        if hasattr(scan, '_var') and sym_key in scan._var:
-            atr_vol = scan._var[sym_key].current_risk_pct() * 2  # ATR约=2×VaR%
-            sl_pct = max(sl_pct, atr_vol)  # 不低于ATR
-    except: pass
-    if usd_net <= -max_loss: close_trade(p, f"maxloss(${usd_net:+.2f})", pr); return
+    # ── 主流币: 固定TP/SL + trailing stop ──
+    max_sl_pct = MAX_LOSS_MAP.get(p.get('sym',''), 4.0)  # 默认4%
+    if pnl_pct <= -max_sl_pct: close_trade(p, f"maxloss({pnl_pct:+.1f}%)", pr); return
     if pnl_pct>=TP: close_trade(p,"tp",pr); return
-    if pnl_pct<=-sl_pct: close_trade(p,"sl",pr); return
+    if pnl_pct<=-SL: close_trade(p,"sl",pr); return
     if elapsed>TIMEOUT: close_trade(p,f"timeout({elapsed/60:.0f}m)",pr); return
-    # 🔧 时间止损: 开仓15分钟仍不盈利就砍
-    if elapsed>TIME_STOP_MIN*60 and usd_net<=0: close_trade(p,f"timestop({elapsed/60:.0f}m)",pr); return
     if elapsed>MAX_STUCK_MIN*60 and pnl_pct<STUCK_THRESHOLD: close_trade(p,f"stuck({elapsed/60:.0f}m)",pr); return
 
     pk=p.get('peak_usd',0)
-    # trail激活和触发用净盈亏
-    if not p.get('trail_active') and pk>=max(p['size']*0.08, 0.50)+fee_rt: p['trail_active']=True; log(f"🔒 {p['sym'].split(':')[0]} trail @${usd_net:.2f}")
+    if not p.get('trail_active') and pk>=TRAIL_ACTIVATE_USD: p['trail_active']=True; log(f"🔒 {p['sym'].split(':')[0]} trail @${pk:.2f}")
     if p.get('trail_active'):
-        dist=0.15  # 兜底：峰<0.5仍保留$0.15安全垫
+        dist=0.12
         for tm,td in sorted(TRAIL_TIERS, reverse=True):
-            if pk-fee_rt>=tm: dist=td; break
-        if usd_net<=pk-fee_rt-dist: close_trade(p,f"trail(${pk-fee_rt:.2f})",pr); return
+            if pk>=tm: dist=td; break
+        if usd<=pk-dist: close_trade(p,f"trail(${pk:.2f})",pr); return
 
     if int(elapsed/60)%2==0 and int((elapsed-SCAN_INTERVAL)/60)%2!=0:
         t='🔒' if p.get('trail_active') else ''; sf='⏳' if elapsed>MAX_STUCK_MIN*60 and pnl_pct<STUCK_THRESHOLD else ''
-        log(f"📊 {p['dir']} {p['sym'].split(':')[0]} PnL:{pnl_pct:+.2f}%×{p.get('leverage',LEVERAGE)}x ${usd_net:+.2f} | ${state.balance:.2f} {t}{sf}")
+        bal_now = balance_fn() or 0
+        log(f"📊 {p['dir']} {p['sym'].split(':')[0]} PnL:{pnl_pct:+.2f}%×{LEVERAGE}x ${usd:+.2f} | ${bal_now:.2f} {t}{sf}")
 
-def report():
-    closed = len(state.wins_list) + len(state.losses_list)
-    wr_calc = len(state.wins_list)/closed*100 if closed else 0
-    log(""); log("═"*55)
-    log(f"💰 ${state.balance:.2f} | Peak:${state.peak:.2f} | {state.trades}t({closed}已平) {len(state.wins_list)}w(WR:{wr_calc:.0f}%)")
-    log(f"📈 ${state.pnl:+.2f} | DD:{((state.peak-state.balance)/state.peak*100):.1f}% | {LEVERAGE}x")
-    for st,(w,l) in sorted(state.sig_stats.items()):
-        t=w+l; wr_s=w/t*100 if t>0 else 0
-        ev=load_evolve(); streak=ev.get('fail_streaks',{}).get(st,0)
-        log(f"   🏷 {st}: {w}/{t} ({wr_s:.0f}%){' ⚠降权' if streak>=3 else ''}")
-    aw=sum(state.wins_list)/len(state.wins_list) if state.wins_list else 0
-    al=sum(state.losses_list)/len(state.losses_list) if state.losses_list else 0
-    log(f"   ✅均${aw:.2f} x{len(state.wins_list)}  ❌均${al:.2f} x{len(state.losses_list)}")
-    # ── 复盘 ──
-    mt=state.main_trades; mw=state.main_wins; mp=state.main_pnl
-    if mt>0: log(f"   🔷 实盘: {mt}t {mw}w | PnL:${mp:+.2f}")
-    # 当前持仓
-    if state.positions:
-        for p in state.positions:
-            pr=price(p['sym'])
-            if pr: log(f"📌 {p['dir']} {p['sym'].split(':')[0]} @{p['entry']:.2f} →{pr:.2f}")
-    else: log(f"📭 等待信号")
-    log("═"*55); log("")
-
-# ─── Main ───
 def main():
     global state
-    if state.balance<START_BALANCE*0.1 and state.trades>0:
-        log(f"🔄 重置 ${state.balance:.2f}→${START_BALANCE}"); state=State(); state.save()
-
-    # 🔧 v25.3: 启动同步 → state余额对齐币安U本位实盘
+    # 从测试网API同步余额和持仓
     try:
-        ex_tmp = ccxt.binance({'apiKey':BINANCE_KEY,'secret':BINANCE_SECRET,
-            'enableRateLimit':True,'options':{'defaultType':'future'},
-            'proxies':{'http':PROXY,'https':PROXY},'timeout':8000})
-        real_bal = ex_tmp.fetch_balance({'type':'swap'})
-        real_free = float(real_bal.get('USDT',{}).get('free',0))
-        real_total = float(real_bal.get('USDT',{}).get('total', real_free))
-        sync_bal = max(real_total, real_free)  # 取总权益，兜底用free
-        if sync_bal > 1 and abs(sync_bal - state.balance) > 0.5:
-            log(f"🔗 同步余额: state${state.balance:.2f} → 币安${sync_bal:.2f}")
-            state.balance = sync_bal
-            state.day_start_bal = sync_bal
-            state.peak = max(state.peak, sync_bal)
-            state.save()
-        del ex_tmp
+        resp = _testnet_get_balance()
+        if resp:
+            free = float(resp.get("availableBalance", 0))
+            if free > 1:
+                log("🔗 余额: ${:.2f}".format(free))
+                state.testnet_balance = free
+                state.day_start_bal = free
+        real_pos = api_positions()
+        if real_pos:
+            state.positions = real_pos
+            for rp in real_pos:
+                log("📌 " + rp["dir"] + " " + rp["sym"] + " qty=" + str(rp["qty"]) + " @" + str(round(rp["entry"],5)))
+        log("📋 启动: ${:.2f} | {}笔".format(balance_fn() or 0, len(state.positions)))
     except Exception as e:
-        log(f"⚠️ 余额同步失败: {str(e)[:60]}")
+        log("⚠️ 启动同步失败: " + str(e)[:60])
 
     ev=load_evolve()
+    mode_tag = '🦅 测试网API'
+    gate_tag = '🌐 MacroGate ON' if MACRO_GATE else '🌐 MacroGate OFF'
     killed=[k for k,v in ev.get('fail_streaks',{}).items() if v>=3]
-    log(f"🦅 v{EVOLVE_VERSION} | ${state.balance:.2f} | {LEVERAGE}x | 6路信号")
+    log(f"🦅 v{EVOLVE_VERSION} | ${balance_fn() or 0:.2f} | {LEVERAGE}x | 6路信号 | {mode_tag} | {gate_tag}")
     if killed: log(f"   ⚠ 已降权: {', '.join(killed)}")
-    log(f"🔴 实盘 | Key: {BINANCE_KEY[:6]}...{BINANCE_KEY[-4:]}")
 
     import signal as sig
+    shutdown_requested = False
     def shutdown(sn,fr):
-        log("🛑 退出")
-        if os.environ.get('NO_SHUTDOWN_SELL'):
-            log("⚠️ NO_SHUTDOWN_SELL=1 → 保持持仓不卖")
-        else:
-            # 🔧 用交易所实际仓位平仓，避免孤儿仓
-            try:
-                ex_sd = exchange()
-                if ex_sd:
-                    ex_pos = ex_sd.fetch_positions()
-                    for ep in ex_pos:
-                        if not isinstance(ep, dict): continue
-                        c = abs(float(ep.get('contracts',0) or 0))
-                        if c < 0.001: continue
-                        ep_sym = ep.get('symbol','')
-                        ep_side = (ep.get('side') or 'long').lower()
-                        cls = 'sell' if ep_side == 'long' else 'buy'
-                        ex_sd.create_market_order(ep_sym, cls, c, {'reduceOnly': True})
-                        log(f"🔴 实盘平仓: {cls} {ep_sym.split(':')[0]} {c}个 [shutdown]")
-                    del ex_sd
-            except Exception as e:
-                log(f"⚠️ shutdown平仓异常: {str(e)[:60]}")
-                for p in list(state.positions): close_trade(p, "shutdown")
-        state.save(); sys.exit(0)
+        nonlocal shutdown_requested
+        log("🛑 signal received → 设置停止标记(不退出)")
+        shutdown_requested = True
     sig.signal(sig.SIGINT,shutdown); sig.signal(sig.SIGTERM,shutdown)
 
-    sigs=scan()
-    # 🔗 从交易所同步持仓（恢复重启后孤儿仓）
-    try:
-        ex_sync = exchange()
-        if ex_sync:
-            ex_positions = ex_sync.fetch_positions()
-            for ep in ex_positions:
-                if not isinstance(ep, dict): continue
-                c = abs(float(ep.get('contracts', 0) or 0))
-                if c < 0.001: continue
-                ep_sym = ep.get('symbol', '')
-                ep_side = (ep.get('side') or '').lower()
-                ep_entry = float(ep.get('entryPrice', 0) or 0)
-                ep_margin = float(ep.get('initialMargin', 0) or 0)
-                if ep_sym and ep_side and ep_entry > 0:
-                    exists = any(p['sym']==ep_sym and p['dir']==ep_side for p in state.positions)
-                    if not exists:
-                        log(f"🔗 同步持仓: {ep_side} {ep_sym.split(':')[0]} @{ep_entry:.5f} margin${ep_margin:.2f}")
-                        state.positions.append({
-                            'sym': ep_sym, 'entry': ep_entry, 'size': round(ep_margin, 2),
-                            'time': time.time(), 'dir': ep_side, 'type': '同步恢复',
-                            'score': 60, 'cat': 'main', 'leverage': int(abs(ep_entry*c/max(ep_margin,0.01))),
-                            'trail_active': False, 'peak_usd': 0, 'qty': c
-                        })
-            del ex_sync
-    except Exception as e:
-        log(f"⚠️ 同步持仓异常: {str(e)[:60]}")
     if state.positions:
-        state.positions = []  # 清空，由交易所同步重建
-    # 🔗 从交易所同步持仓
-    try:
-        ex_sync = exchange()
-        if ex_sync:
-            ex_positions = ex_sync.fetch_positions()
-            all_ex_pos = []
-            for ep in ex_positions:
-                if not isinstance(ep, dict): continue
-                c = abs(float(ep.get('contracts', 0) or 0))
-                if c < 0.001: continue
-                ep_sym = ep.get('symbol', '')
-                ep_side = (ep.get('side') or 'long').lower()
-                ep_entry = float(ep.get('entryPrice', 0) or 0)
-                ep_margin = float(ep.get('initialMargin', 0) or 0)
-                all_ex_pos.append({'sym':ep_sym,'entry':ep_entry,'size':round(ep_margin,2),
-                    'time':time.time(),'dir':ep_side,'type':'同步','score':60,'cat':'main',
-                    'leverage':20,'trail_active':False,'peak_usd':0,'qty':c,
-                    'sl_pct':0.5,'max_loss':1.0})
-            state.positions = all_ex_pos
-            for p in state.positions:
-                log(f"📌 同步持仓: {p['dir']} {p['sym'].split(':')[0]} @{p['entry']:.5f} sz:{p['size']}U")
-            state.save()
-            del ex_sync
-    except Exception as e:
-        log(f"⚠️ 同步持仓异常: {str(e)[:60]}")
-    # 启动信号分发
-    if sigs:
-        cand=[s for s in sigs if not any((s['sym'],s['dir'])==(p['sym'],p['dir']) for p in state.positions)]
-        if cand: log(f"🎯 {cand[0]['dir']} {cand[0]['sym'].split(':')[0]} [{cand[0]['type']}] sc:{cand[0]['sc']:.1f}"); open_trade(cand[0])
-    else:
-        log(f"📭 启动扫描无信号")
-
+        for p in state.positions:
+            log(f"📌 持仓: {p['dir']} {p['sym'].split(':')[0]} @{p['entry']:.5f}")
+    sigs=scan()
     lr=time.time(); sc=1
-    
-    # 🔬 初始化量化模型
-    scan._hmm = {s: HMMRegime(80) for s in SYMBOLS}
-    scan._vol = {s: VolatilityModel() for s in SYMBOLS}
-    scan._var = {s: VaRManager(100) for s in SYMBOLS}
-    
     while True:
         try:
+            if shutdown_requested:
+                log("🛑 收到停止信号, 保留持仓退出")
+                if state.positions:
+                    for p in list(state.positions):
+                        log(f"  保有: {p['dir']} {p['sym']} @{p.get('entry',0):.5f}")
+                sys.exit(0)
             now=time.time(); sc+=1
-            if now-state.day_start_t>86400: state.day_start_bal=state.balance; state.day_start_t=now; state.stopped=False; log(f"🌅 新一天 | ${state.balance:.2f}")
-
-            dp=(state.balance-state.day_start_bal)/state.day_start_bal
-            loss_usd = state.balance - state.day_start_bal
-            if (dp<=MAX_DAY_LOSS or loss_usd <= -MAX_LOSS_USD) and not state.stopped:
-                if loss_usd <= -MAX_LOSS_USD:
-                    state.stopped=True; state.melt_until=float('inf')
-                    log(f"⛔ 亏损${loss_usd:.2f} ≥ $5 → 永久熔断!"); state.save()
+            if now-state.day_start_t>86400 or state.day_start_bal<1:
+                new_bal = balance_fn()
+                if new_bal is not None and new_bal > 0:
+                    state.day_start_bal = new_bal
+                elif state.last_known_balance > 0:
+                    state.day_start_bal = state.last_known_balance  # 用缓存
                 else:
-                    state.stopped=True; state.melt_until=now+1800
-                    log(f"⛔ 日亏{dp*100:.0f}% 熔断 | 30min后恢复"); state.save()
-            elif state.stopped and now>=state.melt_until and dp>MAX_DAY_LOSS+0.03:
-                state.stopped=False; log(f"✅ 恢复交易"); state.save()
+                    pass  # 保持旧值, 等API恢复
+                state.day_start_t=now
+                state.stopped=False
+                log(f"🌅 新一天 | ${state.day_start_bal:.2f}")
 
-            dd=(state.peak-state.balance)/state.peak if state.peak>0 else 0
-            if dd>=MAX_DD and not state.stopped:
-                state.stopped=True; state.melt_until=now+1800
-                log(f"⛔ 回撤{dd*100:.0f}% 熔断 | 30min后恢复"); state.save()
-            elif state.stopped and now>=state.melt_until and dd<MAX_DD-0.02 and dp>MAX_DAY_LOSS:
-                state.stopped=False; log(f"✅ 恢复交易"); state.save()
+            # v27: 日亏熔断(API容错) - 余额不可用时跳过检查
+            if state.day_start_bal > 1:
+                bal_now = balance_fn()
+                if bal_now is None:
+                    pass  # API不可用, 跳过本轮熔断检查
+                elif bal_now > 0:
+                    dp=(bal_now-state.day_start_bal)/state.day_start_bal
+                    loss_usd = bal_now - state.day_start_bal
+                    if (dp<=MAX_DAY_LOSS or loss_usd <= -MAX_LOSS_USD) and not state.stopped:
+                        state.stopped=True; state.melt_until=float('inf')
+                        log(f"⛔ 永久熔断 | ${bal_now:.2f} day_start:${state.day_start_bal:.2f}")
+                    elif state.stopped and now>=state.melt_until and dp>MAX_DAY_LOSS+0.03:
+                        state.stopped=False; log(f"✅ 恢复交易")
 
             if state.positions:
                 check_positions()
-                if int(now)%30<SCAN_INTERVAL: state.save()
 
-            # v25.4: 连亏熔断检查（所有类别共用consec_losses）
+            # v27: 滑动窗口连亏冷却 + 指数退避
+            # 1. 清理过期记录(超过CONSEC_DECAY_SEC的)
+            cutoff = now - CONSEC_DECAY_SEC
+            state.consec_history = [h for h in state.consec_history if h[0] > cutoff]
+            # 2. 重新计算窗口内连亏数
+            window_losses = sum(1 for h in state.consec_history if not h[1])
+            # 3. 连亏自动衰减: 如果最近1h内没有亏损, 重置计数器
+            has_recent_loss = any(not h[1] for h in state.consec_history if h[0] > now - 3600)
+            if not has_recent_loss and state.consec_losses > 0:
+                state.consec_losses = 0
+                state.consec_melt_until = 0
+                state.consec_history.clear()
+                log(f"🟢 连亏超过1h无新亏损 → 自动重置")
+            # 4. 指数退避冷却: 根据窗口内连亏数查表
+            cooldown_sec = CONSEC_COOLDOWN_BASE
+            for (n, cd) in sorted(CONSEC_COOLDOWN_TIERS, reverse=True):
+                if window_losses >= n:
+                    cooldown_sec = cd; break
+            # 5. 冷却检查
             if state.consec_melt_until > 0:
                 if now >= state.consec_melt_until:
-                    state.consec_losses = 0
+                    state.consec_losses = max(0, state.consec_losses - 1)  # 渐进恢复: 减1笔而非清零
                     state.consec_melt_until = 0
-                    log(f"✅ 连亏冷却结束 恢复交易")
-                    state.save()
+                    log(f"✅ 连亏冷却结束 (剩余连亏计数: {state.consec_losses})")
                 elif state.consec_losses > 0 and int(now)%60 < SCAN_INTERVAL:
                     remaining = (state.consec_melt_until - now) / 60
-                    log(f"🧊 连亏冷却中 {remaining:.0f}分 (已连亏{state.consec_losses}笔)")
+                    log(f"🧊 连亏冷却中 {remaining:.0f}分 (窗口{window_losses}笔连亏, 共退避{cooldown_sec//60}分)")
+
+            # v27: 方向熔断到期检查
+            for d in ['long', 'short']:
+                if state.dir_melt_until.get(d, 0) > 0 and now >= state.dir_melt_until[d]:
+                    del state.dir_melt_until[d]
+                    if d == 'long': state.consec_long_losses = 0
+                    else: state.consec_short_losses = 0
+                    log(f"✅ {d}方向熔断到期，恢复交易")
+
+            # v27: API全挂检测 — 连续10次scan失败 → 暂停30分钟
+            if sc > 10 and state.consec_scan_fails > 10:
+                log(f"⛔ API持续不可达({state.consec_scan_fails}次) → 暂停30分钟")
+                time.sleep(1800)
+                state.consec_scan_fails = 0
 
             if len(state.positions)<MAX_POSITIONS and not state.stopped and not (0 < state.consec_melt_until > now):
                 if now-state.last_trade>=COOLDOWN:
+                    macro_ok, macro_reason = True, ''
+                    if MACRO_GATE and sc % 6 == 0:
+                        macro_ok, macro_reason = check_macro_gate()
+                        if not macro_ok:
+                            log(f"🌐 Macro Gate BLOCK: {macro_reason}")
                     sigs=scan()
-                    # 🔬 HMM regime 打分
-                    for s in sigs:
-                        sym_key = s['sym']
-                        if sym_key in scan._hmm:
-                            try:
-                                h = scan._hmm[sym_key]
-                                tick = fetch(exchange().fetch_ticker, sym_key)
-                                if tick:
-                                    h.update(tick.get('last', s['pr']))
-                                bonus = h.regime_score(s['dir'])
-                                if bonus != 0:
-                                    s['sc'] = round(s['sc'] + bonus, 1)
-                                    s['hmm_regime'] = h.current_regime
-                                    regime_name = ['🐻跌','📊横','🐂涨'][min(h.current_regime, 2)]
-                                    log(f"🔬 HMM {sym_key.split(':')[0]} {regime_name} → {s['dir']} {bonus:+d}分 sc:{s['sc']:.0f}")
-                            except: pass
-                        # 喂 VaR
-                        if sym_key in scan._var:
-                            try:
-                                tick = fetch(exchange().fetch_ticker, sym_key)
-                                if tick: scan._var[sym_key].update(tick.get('last', s['pr']))
-                            except: pass
-                    # 加波动率仓位调整
-                    try:
-                        sym_key = sigs[0]['sym'] if sigs else None
-                        if sym_key and sym_key in scan._vol:
-                            state._vol_mult = scan._vol[sym_key].position_multiplier()
-                            # 🔬 VaR 风险限制: 每笔最多亏2%余额
-                            if sym_key in scan._var:
-                                var_mgr = scan._var[sym_key]
-                                var_pct = var_mgr.current_risk_pct()  # 单K线VaR%
-                                # 仓位上限 = (5%余额) / (VaR% × 20x) 回本模式
-                                risk_limit = state.balance * 0.05 / max(var_pct * LEVERAGE, 0.001)
-                                state._var_limit = min(risk_limit, state.balance * 0.95)
-                    except: pass
-                    
-                    _log_scan_summary(sigs, [], MIN_SCORE)
                     for s in sigs:
                         if len(state.positions)>=MAX_POSITIONS: break
+                        if not macro_ok:
+                            continue
+                        # v27: 同币同向5分钟冷却(防重复开单)
+                        sym_dir_key = s['sym'] + s['dir']
+                        recent_same = any(
+                            t.get('sym','') == s['sym'].split(':')[0] and t.get('dir','') == s['dir']
+                            and time.time() - _parse_trade_ts(t.get('time','')) < 300
+                            for t in state.trade_history[-10:]
+                        )
+                        if recent_same:
+                            if sc % 30 == 0:  # 减少日志噪音
+                                log(f"⏱ {s['sym'].split(':')[0]} {s['dir']} 同向5min冷却 → 跳过")
+                            continue
                         open_trade(s)
                     if not sigs and sc%10==0:
-                        log(f"📭 扫{sc}轮 | ${state.balance:.2f}")
+                        log(f"📭 扫{sc}轮 | ${balance_fn() or 0:.2f}")
 
-            if now-lr>=1800: report(); lr=now
-            # 🔧 心跳: 每5分钟确认存活
-            if int(now/60)%5==0 and int(now)%60<SCAN_INTERVAL:
-                pos_count = len(state.positions)
-                log(f"💓 alive | ${state.balance:.2f} | {pos_count}持仓 | 扫{sc}轮")
+            if now-lr>=1800:
+                closed = len(state.wins_list)+len(state.losses_list)
+                wr_calc = len(state.wins_list)/closed*100 if closed else 0
+                log(f"💰 ${balance_fn() or 0:.2f} | {len(state.wins_list)}w(WR:{wr_calc:.0f}%)")
+                lr=now
+
+            # 写入价格快照 (v27.1: 加超时保护防卡死)
+            try:
+                ex_prices = exchange()
+                if ex_prices and sc % 3 == 0:  # 每3轮写一次, 减少IO
+                    prices_data = {"ts": time.time(), "data": {}}
+                    sym_count = 0
+                    for sym in SYMBOLS:
+                        try:
+                            t = ex_prices.fetch_ticker(sym)
+                            if t and t.get('last', 0) > 0:
+                                prices_data["data"][sym] = {
+                                    'last': t['last'], 'bid': t.get('bid', 0),
+                                    'ask': t.get('ask', 0), 'change': t.get('percentage', 0)
+                                }
+                                sym_count += 1
+                        except Exception: pass  # ticker跳过
+                    if sym_count > 0:
+                        tmp_path = BOT_DIR / 'prices.json.tmp'
+                        with open(tmp_path, 'w') as f:
+                            json.dump(prices_data, f)
+                        os.replace(tmp_path, BOT_DIR / 'prices.json')
+            except Exception as pe:
+                if sc % 60 == 0:
+                    log(f"⚠️ prices写入异常: {str(pe)[:50]}")
+
+            # 定期同步测试网余额
+            if sc % 30 == 0:
+                try:
+                    bal = _testnet_get_balance()
+                    if bal:
+                        real_free = float(bal.get('availableBalance', 0))
+                        if real_free > 1:
+                            state.testnet_balance = real_free
+                except: pass
+
+            # 每分钟同步测试网持仓（merge，保留运行时字段）
+            if sc % 6 == 0:
+                try:
+                    real_pos = api_positions()
+                    if real_pos:
+                        # merge: 保留 cat/trail/peak 等运行时字段
+                        api_map = {}
+                        for rp in real_pos:
+                            api_map[rp['sym']+rp['dir']] = rp
+                        for existing in state.positions:
+                            key = existing.get('sym','') + existing.get('dir','')
+                            api_p = api_map.get(key)
+                            if api_p:
+                                for f in ('entry','mark','pnl_u','qty','size','time'):
+                                    if f in api_p:
+                                        existing[f] = api_p[f]
+                        # 添加API有但state没有的新持仓
+                        state_keys = set(p.get('sym','')+p.get('dir','') for p in state.positions)
+                        for key, rp in api_map.items():
+                            if key not in state_keys:
+                                state.positions.append(rp)
+                except: pass
+
+            # 每20分钟系统巡检
+            if sc % 120 == 0 and sc > 0:
+                session_closed = len(state.wins_list) + len(state.losses_list)
+                session_wr = len(state.wins_list)/session_closed*100 if session_closed else 0
+                log(f"🔍 巡检 #{sc//120}: Bot:🟢 | 余额:${balance_fn() or 0:.0f} | 持仓:{len(state.positions)} | 今日:{session_closed}笔 WR:{session_wr:.0f}% | 熔断:{'❌' if state.stopped else '✅'}")
+
             time.sleep(SCAN_INTERVAL)
         except KeyboardInterrupt: shutdown(None,None)
         except Exception as e:
             crash_count = getattr(main, '_crash_count', 0) + 1
             main._crash_count = crash_count
             log(f"💥 崩溃#{crash_count}: {str(e)[:120]}")
-            traceback.print_exc()
-            if crash_count >= 3 and time.time() - getattr(main, '_first_crash', time.time()) < 300:
-                log(f"⛔ 5分钟内崩溃{crash_count}次 → 退出，等待人工介入")
-                state.save()
-                sys.exit(1)
-            if crash_count == 1:
-                main._first_crash = time.time()
-            time.sleep(30)
-
+            # v27.1: 自愈 — 缺失属性自动补充
+            for attr_name, attr_default in [
+                ('consec_scan_fails', 0), ('consec_losses', 0), ('consec_melt_until', 0),
+                ('consec_history', []), ('consec_long_losses', 0), ('consec_short_losses', 0),
+                ('dir_losses', {}), ('dir_melt', {}), ('dir_melt_until', {}),
+                ('bal_fault_count', 0), ('last_known_balance', 0.0),
+                ('main_pnl', 0.0),
+                ('main_trades', 0), ('main_wins', 0),
+                ('trades', 0), ('wins', 0), ('stopped', False), ('sig_stats', {}),
+                ('day_start_bal', 0.0), ('day_start_t', time.time()),
+                ('trade_history', []), ('startup_time', time.time()),
+                ('main_losses', 0),  # v27.3
+            ]:  # v27.3: 补全自愈字段
+                if not hasattr(state, attr_name):
+                    setattr(state, attr_name, attr_default)
+                    log(f"🩹 自愈: state.{attr_name} → {attr_default}")
+            # 指数退避: 连崩超过5次, 等更久 (v27.3: 轮询支持shutdown)
+            if crash_count <= 5:
+                wait = min(30 * (2 ** (crash_count - 1)), 300)
+            else:
+                wait = 600
+            log(f"⏳ 崩溃退避 {wait}s (第{crash_count}次)")
+            for _ in range(min(wait, 600)):
+                if shutdown_requested:
+                    log("🛑 退避期间收到停止信号")
+                    sys.exit(0)
+                time.sleep(1)
 if __name__=='__main__':
-    # PID 锁: 防止多实例同时运行
     import fcntl
     LOCK_FILE = BOT_DIR / "trader.lock"
     lock_fd = open(LOCK_FILE, 'w')
@@ -1187,6 +1309,6 @@ if __name__=='__main__':
         print(f"❌ 另一个 trader 实例已在运行 (PID {old_pid})")
         sys.exit(1)
     lock_fd.write(str(os.getpid())); lock_fd.flush()
-    
-    state.startup_time=time.time(); state.save()
+    os.environ['PAPERBOT_NO_SHUTDOWN_SELL']='1'
+    state.startup_time=time.time()
     main()
